@@ -1,53 +1,156 @@
 const fetch = require('node-fetch')
 const regression = require('regression');
 const ss = require('simple-statistics');
+const fs = require('fs').promises;
+
+
+class Portfolio {
+  constructor() {
+    this.positions = {
+      symbol1: 0,
+      symbol2: 0,
+    };
+    this.cash = 100000; // Starting cash
+  }
+
+  update(symbol, quantity, price) {
+    if (symbol === 'symbol1') {
+      this.positions.symbol1 += quantity;
+    } else if (symbol === 'symbol2') {
+      this.positions.symbol2 += quantity;
+    }
+    this.cash -= quantity * price;
+  }
+
+  value(prices) {
+    return (
+      this.cash +
+      this.positions.symbol1 * prices.symbol1 +
+      this.positions.symbol2 * prices.symbol2
+    );
+  }
+
+	print(prices, text="") {
+		const portfolioValue = this.value(prices);
+		console.log(`Total Value: ${portfolioValue}, ${text}, Symbol1: ${this.positions.symbol1}, Symbol2: ${this.positions.symbol2}, Cash: ${this.cash}`)
+	}
+}
+
+async function main(symbol1, symbol2, endDate, period) {
+  const portfolio = new Portfolio();
+  let date = new Date(endDate);
+
+  for (let i = 0; i < period; i++) {
+    const otherPrices = await getData(symbol1, date.getTime());
+    const ethPrices = await getData(symbol2, date.getTime());
+    if (otherPrices === undefined || ethPrices === undefined ) {
+      continue
+    }
+    const otherClose = otherPrices.map((price) => price.close);
+    const ethClose = ethPrices.map((price) => price.close);
+
+    const tradeDecision = makeTrade(portfolio, otherClose, ethClose);
+    if (tradeDecision.symbol1) {
+      portfolio.update('symbol1', tradeDecision.symbol1, otherClose[otherClose.length - 1]);
+    }
+    if (tradeDecision.symbol2) {
+      portfolio.update('symbol2', tradeDecision.symbol2, ethClose[ethClose.length - 1]);
+    }
+
+    // const portfolioValue = portfolio.value({
+    //   symbol1: otherClose[otherClose.length - 1],
+    //   symbol2: ethClose[ethClose.length - 1],
+    // });
+    // console.log(`Portfolio value at time ${i}: ${portfolioValue}`);
+		if (i == period - 1) {
+			portfolio.print({
+				symbol1: otherClose[otherClose.length - 1],
+				symbol2: ethClose[ethClose.length - 1],
+			}, `Trading Pair: ${symbol1}-${symbol2}`)
+		}
+
+    date.setDate(date.getDate() - 1); // Move back one day
+  }
+}
+
+function makeTrade(portfolio, priceArray1, priceArray2, maxlag = 1, buyThreshold = 1.5, sellThreshold = 0.5) {
+  const { F1, F2 } = grangerCausality(priceArray1, priceArray2, maxlag);
+  const correlation = correlationCoefficient(priceArray1, priceArray2);
+
+  const tradeDecision = {
+    symbol1: 0,
+    symbol2: 0,
+  };
+
+	// Calculate position sizes based on F1, F2, and correlation
+	const positionSize1 = F1**2 * (Math.max(correlation, 0));
+	const positionSize2 = F2**2 * (Math.max(correlation, 0));
+
+	// Calculate current value of the portfolio
+	const currentPortfolioValue = portfolio.value({
+		symbol1: priceArray1[priceArray1.length - 1],
+		symbol2: priceArray2[priceArray2.length - 1],
+	});
+
+	// Calculate the maximum USD position size based on our portfolio with leverage
+	const maxUsdPositionSize1 = 10 * currentPortfolioValue;
+	const maxUsdPositionSize2 = 10 * currentPortfolioValue;
+
+	// Limit the position size to 10% of the dollar value of our portfolio in terms of token amount
+	const maxPositionSize1 = Math.min(positionSize1, maxUsdPositionSize1 / priceArray1[priceArray1.length - 1]);
+	const maxPositionSize2 = Math.min(positionSize2, maxUsdPositionSize2 / priceArray2[priceArray2.length - 1]);
+
+
+  if (F1 > buyThreshold) {
+    tradeDecision.symbol1 = maxPositionSize1;
+  }
+
+  if (F2 > buyThreshold) {
+    tradeDecision.symbol2 = maxPositionSize2;
+  }
+
+  if (F1 < sellThreshold) {
+    tradeDecision.symbol1 = -maxPositionSize1;
+  }
+
+  if (F2 < sellThreshold) {
+    tradeDecision.symbol2 = -maxPositionSize2;
+  }
+
+  return tradeDecision;
+}
 
 async function getData(symbol, endTimestamp) {
-  const url = `https://min-api.cryptocompare.com/data/v2/histohour?fsym=${symbol}&tsym=USD&limit=100&toTs=${endTimestamp}`
-  const response = await fetch(url)
-  const data = await response.json()
+  const cacheFileName = `cache_${symbol}_${endTimestamp}.json`;
+
+  try {
+    // Try reading from the cache file
+    const cacheFileContent = await fs.readFile(cacheFileName, 'utf8');
+    const cachedPrices = JSON.parse(cacheFileContent);
+    return cachedPrices;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.error('Error reading cache file:', error);
+    }
+  }
+
+  // If cache file does not exist or there was an error, fetch new data
+  const url = `https://min-api.cryptocompare.com/data/v2/histohour?fsym=${symbol}&tsym=USD&limit=100&toTs=${endTimestamp}`;
+  const response = await fetch(url);
+  const data = await response.json();
   const prices = data['Data']['Data'];
-  return prices
+
+  try {
+    // Save fetched data to cache file
+    await fs.writeFile(cacheFileName, JSON.stringify(prices), 'utf8');
+    console.log('Data fetched and cached');
+  } catch (error) {
+    console.error('Error writing cache file:', error);
+  }
+
+  return prices;
 }
 
-async function main(symbol1, symbol2, endDate) {
-  const btcPrices = await getData(symbol1, endDate)
-  const ethPrices = await getData(symbol2, endDate)
-  const btcClose = btcPrices.map(price => price.close)
-  const ethClose = ethPrices.map(price => price.open)
-  console.log("BTC", btcClose)
-  const correlation = correlationCoefficient(btcClose, ethClose)
-  console.log("Correlation", correlation)
-  const leadingIndicator = grangerCausality(btcClose, ethClose)
-  console.log(leadingIndicator)
-  makeTrade(btcClose, ethClose)
-}
-
-function makeTrade(priceArray1, priceArray2, maxlag = 1, buyThreshold = 1.5, sellThreshold = 0.5) {
-  const { F1, F2 } = grangerCausality(priceArray1, priceArray2, maxlag);
-  
-  if (F1 > buyThreshold) {
-    // Generate a buy signal for priceArray1
-    console.log("Buy signal for priceArray1");
-  }
-  
-  if (F2 > buyThreshold) {
-    // Generate a buy signal for priceArray2
-    console.log("Buy signal for priceArray2");
-  }
-  
-  if (F1 < sellThreshold) {
-    // Generate a sell signal for priceArray1
-    console.log("Sell signal for priceArray1");
-  }
-  
-  if (F2 < sellThreshold) {
-    // Generate a sell signal for priceArray2
-    console.log("Sell signal for priceArray2");
-  }
-}
-
-// Function that returns correlation coefficient.
 function correlationCoefficient(X, Y) {
   let n = X.length;
   let sum_X = 0,
@@ -80,11 +183,6 @@ function correlationCoefficient(X, Y) {
 
   return corr;
 }
-
-
-
-
-//////////////////////////////////////////
 
 function grangerCausality(priceArray1, priceArray2, maxlag = 1) {
   if (priceArray1.length !== priceArray2.length) {
@@ -125,8 +223,32 @@ function grangerCausality(priceArray1, priceArray2, maxlag = 1) {
 
   return { F1, F2 };
 }
-//////////////////////////////////////////
 
 
-const endDate = new Date('2021-05-03')
-main('BTC', 'ETH', endDate.getTime())
+async function holdLongSymbol(symbol, endDate, period) {
+  const portfolio = new Portfolio();
+  let date = new Date(endDate);
+
+  const ethPrices = await getData(symbol, date.getTime());
+	const ethClose = ethPrices.map((price) => price.close);
+	const maxEthAvailable = 100000 * ethClose[ethClose.length - 1]
+	portfolio.update('symbol1', maxEthAvailable, ethClose[ethClose.length - 1]);
+
+	date.setDate(date.getDate() - period + 1); 
+	const endEthPrices = await getData(symbol, date.getTime());
+	const endEthClose = endEthPrices.map((price) => price.close);
+
+	console.log("VALUE OF HOLDING ETH: ", maxEthAvailable * 1 / endEthClose[endEthClose.length - 1])
+}
+
+
+const endDate = new Date('2021-05-03');
+// const endDate = new Date('2022-12-03');
+// main('BTC', 'ETH', endDate.getTime(), 100); // Backtest for 100 periods
+main('ETH', 'BTC', endDate.getTime(), 50);
+main('ETH', 'DOGE', endDate.getTime(), 50); 
+main('ETH', 'BNB', endDate.getTime(), 50); 
+main('ETH', 'SHIB', endDate.getTime(), 50); 
+main('ETH', 'AAVE', endDate.getTime(), 50); 
+main('ETH', 'ARB', endDate.getTime(), 50); 
+holdLongSymbol("ETH",endDate.getTime(), 50)
